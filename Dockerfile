@@ -1,12 +1,13 @@
-FROM python:3.7-slim-buster
+FROM python:3.7.17-slim-bullseye
 
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y \
+    apt-get install -y --no-install-recommends \
     libstdc++6 \
-    libgcc1 \
+    libgcc-s1 \
     libgomp1 \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -18,4 +19,4 @@ COPY . .
 
 ENV PYTHONUNBUFFERED=1
 
-CMD gunicorn --bind 0.0.0.0:${PORT:-10000} app:app
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-10000} app:app"]
