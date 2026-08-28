@@ -1,3 +1,4 @@
 Flask==2.2.5
 gunicorn==20.1.0
+numpy==1.21.6
 forexconnect==1.6.43
