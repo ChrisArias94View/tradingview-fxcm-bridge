@@ -46,13 +46,10 @@ def get_account(fx):
         ForexConnect.ACCOUNTS
     )
 
-    # Primero intenta usar una cuenta self-traded normal
     for account in accounts:
         if account.account_kind == "32":
             return account
 
-    # Si no encuentra account_kind 32,
-    # utiliza la primera cuenta disponible
     for account in accounts:
         return account
 
@@ -62,16 +59,12 @@ def get_account(fx):
 
 
 # =============================================================================
-# OBTENER INSTRUMENTO DISPONIBLE
+# NORMALIZAR SIMBOLO
 # =============================================================================
 
-def get_offer(fx, instrument):
-    offers = fx.get_table(
-        ForexConnect.OFFERS
-    )
-
-    normalized = (
-        instrument
+def normalize_symbol(symbol):
+    return (
+        str(symbol)
         .replace("/", "")
         .replace("-", "")
         .replace("_", "")
@@ -79,27 +72,33 @@ def get_offer(fx, instrument):
         .upper()
     )
 
+
+# =============================================================================
+# OBTENER OFFER
+# =============================================================================
+
+def get_offer(fx, instrument):
+    offers = fx.get_table(
+        ForexConnect.OFFERS
+    )
+
+    requested = normalize_symbol(
+        instrument
+    )
+
     available = []
 
     for offer in offers:
+
         offer_name = str(
             offer.instrument
-        )
-
-        offer_normalized = (
-            offer_name
-            .replace("/", "")
-            .replace("-", "")
-            .replace("_", "")
-            .replace(" ", "")
-            .upper()
         )
 
         available.append(
             offer_name
         )
 
-        if offer_normalized == normalized:
+        if normalize_symbol(offer_name) == requested:
             return offer
 
     raise RuntimeError(
@@ -127,6 +126,20 @@ def open_market_order(
         instrument
     )
 
+    subscription_status = str(
+        offer.subscription_status
+    )
+
+    if subscription_status != "T":
+
+        raise RuntimeError(
+            "Instrument is not tradable. "
+            + "Instrument="
+            + str(offer.instrument)
+            + " subscription_status="
+            + subscription_status
+        )
+
     side = (
         fxcorepy.Constants.BUY
         if is_buy
@@ -138,10 +151,12 @@ def open_market_order(
         ACCOUNT_ID=account.account_id,
         BUY_SELL=side,
         AMOUNT=int(amount),
-        SYMBOL=offer.instrument
+        SYMBOL=str(offer.instrument)
     )
 
-    request_id = request_order.request_id
+    request_id = (
+        request_order.request_id
+    )
 
     fx.send_request(
         request_order
@@ -149,7 +164,8 @@ def open_market_order(
 
     return {
         "request_id": request_id,
-        "instrument": offer.instrument
+        "instrument": str(offer.instrument),
+        "subscription_status": subscription_status
     }
 
 
@@ -169,16 +185,11 @@ def close_positions(
 
     account = get_account(fx)
 
-    closed = []
-
-    normalized_requested = (
+    requested = normalize_symbol(
         instrument
-        .replace("/", "")
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
-        .upper()
     )
+
+    closed = []
 
     for trade in trades:
 
@@ -186,16 +197,7 @@ def close_positions(
             trade.instrument
         )
 
-        trade_normalized = (
-            trade_instrument
-            .replace("/", "")
-            .replace("-", "")
-            .replace("_", "")
-            .replace(" ", "")
-            .upper()
-        )
-
-        if trade_normalized != normalized_requested:
+        if normalize_symbol(trade_instrument) != requested:
             continue
 
         is_long = (
@@ -251,28 +253,34 @@ def home():
 
 
 # =============================================================================
-# STATUS
+# STATUS GENERAL
 # =============================================================================
 
 @app.route("/status", methods=["GET"])
 def status():
 
     if not FXCM_USERNAME:
+
         return jsonify({
             "bridge": "online",
             "fxcm": "credentials_missing",
             "missing": "FXCM_USERNAME"
         }), 500
 
+
     if not FXCM_PASSWORD:
+
         return jsonify({
             "bridge": "online",
             "fxcm": "credentials_missing",
             "missing": "FXCM_PASSWORD"
         }), 500
 
+
     try:
+
         with lock:
+
             with get_fxcm() as fx:
 
                 account = get_account(fx)
@@ -286,6 +294,7 @@ def status():
                     "used_margin": account.used_margin,
                     "usable_margin": account.usable_margin
                 }), 200
+
 
     except Exception as e:
 
@@ -302,14 +311,16 @@ def status():
 
 
 # =============================================================================
-# LISTAR INSTRUMENTOS DISPONIBLES
+# LISTAR INSTRUMENTOS
 # =============================================================================
 
 @app.route("/instruments", methods=["GET"])
 def instruments():
 
     try:
+
         with lock:
+
             with get_fxcm() as fx:
 
                 offers = fx.get_table(
@@ -319,6 +330,7 @@ def instruments():
                 instrument_list = []
 
                 for offer in offers:
+
                     instrument_list.append(
                         str(offer.instrument)
                     )
@@ -328,6 +340,52 @@ def instruments():
                     "count": len(instrument_list),
                     "instruments": instrument_list
                 }), 200
+
+
+    except Exception as e:
+
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+
+# =============================================================================
+# ESTADO EUR/USD
+# =============================================================================
+
+@app.route("/instrument-status", methods=["GET"])
+def instrument_status():
+
+    try:
+
+        with lock:
+
+            with get_fxcm() as fx:
+
+                offers = fx.get_table(
+                    ForexConnect.OFFERS
+                )
+
+                for offer in offers:
+
+                    if str(offer.instrument) == "EUR/USD":
+
+                        return jsonify({
+                            "instrument": str(offer.instrument),
+                            "offer_id": str(offer.offer_id),
+                            "subscription_status": str(
+                                offer.subscription_status
+                            ),
+                            "bid": float(offer.bid),
+                            "ask": float(offer.ask)
+                        }), 200
+
+                return jsonify({
+                    "status": "error",
+                    "message": "EUR/USD not found"
+                }), 404
+
 
     except Exception as e:
 
@@ -349,6 +407,7 @@ def tradingview():
     )
 
     if not data:
+
         return jsonify({
             "status": "error",
             "message": "Invalid JSON"
@@ -475,7 +534,10 @@ def tradingview():
                         "action": "BUY",
                         "symbol": result["instrument"],
                         "quantity": quantity,
-                        "request_id": result["request_id"]
+                        "request_id": result["request_id"],
+                        "subscription_status": result[
+                            "subscription_status"
+                        ]
                     }), 200
 
 
@@ -502,7 +564,10 @@ def tradingview():
                         "action": "SELL",
                         "symbol": result["instrument"],
                         "quantity": quantity,
-                        "request_id": result["request_id"]
+                        "request_id": result["request_id"],
+                        "subscription_status": result[
+                            "subscription_status"
+                        ]
                     }), 200
 
 
