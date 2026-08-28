@@ -18,9 +18,9 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 lock = threading.Lock()
 
 
-# ------------------------------------------------------------------
-# LOGIN FXCM
-# ------------------------------------------------------------------
+# =============================================================================
+# CONEXION FXCM
+# =============================================================================
 
 def get_fxcm():
     fx = ForexConnect()
@@ -37,30 +37,32 @@ def get_fxcm():
     return fx
 
 
-# ------------------------------------------------------------------
-# ACCOUNT
-# ------------------------------------------------------------------
+# =============================================================================
+# OBTENER CUENTA
+# =============================================================================
 
 def get_account(fx):
-    login_rules = fx.login_rules
-    trading_settings = login_rules.trading_settings_provider
-
     accounts = fx.get_table(
         ForexConnect.ACCOUNTS
     )
 
+    # Primero buscar cuenta normal self-traded
     for account in accounts:
         if account.account_kind == "32":
-            continue
+            return account
 
+    # Si no existe, usar la primera disponible
+    for account in accounts:
         return account
 
-    raise RuntimeError("No valid FXCM account found")
+    raise RuntimeError(
+        "No FXCM account found"
+    )
 
 
-# ------------------------------------------------------------------
-# OFFER
-# ------------------------------------------------------------------
+# =============================================================================
+# OBTENER OFFER EUR/USD
+# =============================================================================
 
 def get_offer(fx, instrument):
     offers = fx.get_table(
@@ -76,9 +78,9 @@ def get_offer(fx, instrument):
     )
 
 
-# ------------------------------------------------------------------
-# OPEN ORDER
-# ------------------------------------------------------------------
+# =============================================================================
+# ABRIR ORDEN MARKET
+# =============================================================================
 
 def open_market_order(
     fx,
@@ -96,22 +98,25 @@ def open_market_order(
         else fxcorepy.Constants.SELL
     )
 
-    request = fx.create_order_request(
+    request_order = fx.create_order_request(
         order_type=fxcorepy.Constants.Orders.TRUE_MARKET_OPEN,
         ACCOUNT_ID=account.account_id,
+        OFFER_ID=offer.offer_id,
         BUY_SELL=side,
         AMOUNT=int(amount),
         SYMBOL=instrument
     )
 
-    response = fx.send_request(request)
+    response = fx.send_request(
+        request_order
+    )
 
     return response.request_id
 
 
-# ------------------------------------------------------------------
-# CLOSE POSITIONS
-# ------------------------------------------------------------------
+# =============================================================================
+# CERRAR POSICIONES
+# =============================================================================
 
 def close_positions(
     fx,
@@ -133,7 +138,10 @@ def close_positions(
         if trade.instrument != instrument:
             continue
 
-        is_long = trade.buy_sell == fxcorepy.Constants.BUY
+        is_long = (
+            trade.buy_sell ==
+            fxcorepy.Constants.BUY
+        )
 
         if close_long and not is_long:
             continue
@@ -147,7 +155,7 @@ def close_positions(
             else fxcorepy.Constants.BUY
         )
 
-        request = fx.create_order_request(
+        request_order = fx.create_order_request(
             order_type=fxcorepy.Constants.Orders.TRUE_MARKET_CLOSE,
             ACCOUNT_ID=account.account_id,
             OFFER_ID=trade.offer_id,
@@ -156,7 +164,9 @@ def close_positions(
             AMOUNT=trade.amount
         )
 
-        response = fx.send_request(request)
+        response = fx.send_request(
+            request_order
+        )
 
         closed.append(
             response.request_id
@@ -165,28 +175,40 @@ def close_positions(
     return closed
 
 
-# ------------------------------------------------------------------
+# =============================================================================
 # HOME
-# ------------------------------------------------------------------
+# =============================================================================
 
 @app.route("/", methods=["GET"])
 def home():
+
     return "Bridge online", 200
 
 
-# ------------------------------------------------------------------
+# =============================================================================
 # STATUS
-# ------------------------------------------------------------------
+# =============================================================================
 
 @app.route("/status", methods=["GET"])
 def status():
 
-    if not FXCM_USERNAME or not FXCM_PASSWORD:
+    if not FXCM_USERNAME:
 
         return jsonify({
             "bridge": "online",
-            "fxcm": "credentials_missing"
+            "fxcm": "credentials_missing",
+            "missing": "FXCM_USERNAME"
         }), 500
+
+
+    if not FXCM_PASSWORD:
+
+        return jsonify({
+            "bridge": "online",
+            "fxcm": "credentials_missing",
+            "missing": "FXCM_PASSWORD"
+        }), 500
+
 
     try:
 
@@ -200,10 +222,19 @@ def status():
                     "bridge": "online",
                     "fxcm": "connected",
                     "connection": FXCM_CONNECTION,
-                    "balance": account.balance
+                    "balance": account.balance,
+                    "equity": account.equity,
+                    "used_margin": account.used_margin,
+                    "usable_margin": account.usable_margin
                 }), 200
 
+
     except Exception as e:
+
+        print(
+            "FXCM STATUS ERROR:",
+            str(e)
+        )
 
         return jsonify({
             "bridge": "online",
@@ -212,9 +243,9 @@ def status():
         }), 500
 
 
-# ------------------------------------------------------------------
-# TRADINGVIEW
-# ------------------------------------------------------------------
+# =============================================================================
+# TRADINGVIEW WEBHOOK
+# =============================================================================
 
 @app.route("/tradingview", methods=["POST"])
 def tradingview():
@@ -231,23 +262,37 @@ def tradingview():
         }), 400
 
 
-    # --------------------------------------------------------------
-    # SECRET
-    # --------------------------------------------------------------
-
-    received_secret = data.get("secret")
-
-    if WEBHOOK_SECRET and received_secret != WEBHOOK_SECRET:
-
-        return jsonify({
-            "status": "rejected",
-            "message": "Invalid secret"
-        }), 403
+    print(
+        "TradingView message received:",
+        data
+    )
 
 
-    # --------------------------------------------------------------
-    # VALIDATION
-    # --------------------------------------------------------------
+    # =========================================================================
+    # VALIDAR SECRET
+    # =========================================================================
+
+    received_secret = data.get(
+        "secret"
+    )
+
+    if WEBHOOK_SECRET:
+
+        if received_secret != WEBHOOK_SECRET:
+
+            print(
+                "Webhook rejected: invalid secret"
+            )
+
+            return jsonify({
+                "status": "rejected",
+                "message": "Invalid secret"
+            }), 403
+
+
+    # =========================================================================
+    # VALIDAR BROKER
+    # =========================================================================
 
     if data.get("broker") != "FXCM":
 
@@ -257,6 +302,10 @@ def tradingview():
         }), 400
 
 
+    # =========================================================================
+    # VALIDAR SIMBOLO
+    # =========================================================================
+
     if data.get("symbol") != "EURUSD":
 
         return jsonify({
@@ -265,7 +314,10 @@ def tradingview():
         }), 400
 
 
-    action = data.get("action")
+    action = data.get(
+        "action"
+    )
+
 
     quantity = int(
         float(
@@ -277,14 +329,29 @@ def tradingview():
     )
 
 
-    # Safety
+    # =========================================================================
+    # SEGURIDAD DE TAMANO
+    # =========================================================================
+
+    if quantity < 1000:
+
+        return jsonify({
+            "status": "rejected",
+            "message": "Minimum quantity is 1000 units"
+        }), 400
+
+
     if quantity > 1000:
 
         return jsonify({
             "status": "rejected",
-            "message": "Maximum 1000 units"
+            "message": "Maximum quantity is 1000 units"
         }), 400
 
+
+    # =========================================================================
+    # EJECUCION
+    # =========================================================================
 
     try:
 
@@ -292,9 +359,9 @@ def tradingview():
 
             with get_fxcm() as fx:
 
-                # --------------------------------------------------
+                # =============================================================
                 # BUY
-                # --------------------------------------------------
+                # =============================================================
 
                 if action == "BUY":
 
@@ -305,18 +372,25 @@ def tradingview():
                         quantity
                     )
 
+                    print(
+                        "FXCM BUY executed:",
+                        request_id
+                    )
+
                     return jsonify({
                         "status": "executed",
                         "action": "BUY",
+                        "symbol": "EUR/USD",
+                        "quantity": quantity,
                         "request_id": request_id
                     }), 200
 
 
-                # --------------------------------------------------
+                # =============================================================
                 # SELL
-                # --------------------------------------------------
+                # =============================================================
 
-                if action == "SELL":
+                elif action == "SELL":
 
                     request_id = open_market_order(
                         fx,
@@ -325,23 +399,35 @@ def tradingview():
                         quantity
                     )
 
+                    print(
+                        "FXCM SELL executed:",
+                        request_id
+                    )
+
                     return jsonify({
                         "status": "executed",
                         "action": "SELL",
+                        "symbol": "EUR/USD",
+                        "quantity": quantity,
                         "request_id": request_id
                     }), 200
 
 
-                # --------------------------------------------------
+                # =============================================================
                 # CLOSE LONG
-                # --------------------------------------------------
+                # =============================================================
 
-                if action == "CLOSE_LONG":
+                elif action == "CLOSE_LONG":
 
                     closed = close_positions(
                         fx,
                         "EUR/USD",
                         close_long=True
+                    )
+
+                    print(
+                        "FXCM CLOSE_LONG:",
+                        closed
                     )
 
                     return jsonify({
@@ -351,16 +437,21 @@ def tradingview():
                     }), 200
 
 
-                # --------------------------------------------------
+                # =============================================================
                 # CLOSE SHORT
-                # --------------------------------------------------
+                # =============================================================
 
-                if action == "CLOSE_SHORT":
+                elif action == "CLOSE_SHORT":
 
                     closed = close_positions(
                         fx,
                         "EUR/USD",
                         close_short=True
+                    )
+
+                    print(
+                        "FXCM CLOSE_SHORT:",
+                        closed
                     )
 
                     return jsonify({
@@ -370,11 +461,11 @@ def tradingview():
                     }), 200
 
 
-                # --------------------------------------------------
+                # =============================================================
                 # CLOSE ALL
-                # --------------------------------------------------
+                # =============================================================
 
-                if action == "CLOSE_ALL":
+                elif action == "CLOSE_ALL":
 
                     longs = close_positions(
                         fx,
@@ -388,6 +479,11 @@ def tradingview():
                         close_short=True
                     )
 
+                    print(
+                        "FXCM CLOSE_ALL:",
+                        longs + shorts
+                    )
+
                     return jsonify({
                         "status": "executed",
                         "action": "CLOSE_ALL",
@@ -395,10 +491,16 @@ def tradingview():
                     }), 200
 
 
-                return jsonify({
-                    "status": "rejected",
-                    "message": "Unknown action"
-                }), 400
+                # =============================================================
+                # ACCION DESCONOCIDA
+                # =============================================================
+
+                else:
+
+                    return jsonify({
+                        "status": "rejected",
+                        "message": "Unknown action"
+                    }), 400
 
 
     except Exception as e:
