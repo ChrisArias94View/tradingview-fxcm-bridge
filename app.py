@@ -31,27 +31,17 @@ WEBHOOK_SECRET = os.environ.get(
 )
 
 
-lock = threading.Lock()
-
-
 # =============================================================================
-# CONEXION FXCM
+# ESTADO GLOBAL
 # =============================================================================
 
-def get_fxcm():
+fx = None
 
-    fx = ForexConnect()
+fx_lock = threading.RLock()
 
-    fx.login(
-        FXCM_USERNAME,
-        FXCM_PASSWORD,
-        FXCM_URL,
-        FXCM_CONNECTION,
-        session_id=None,
-        pin=None
-    )
+fx_connected = False
 
-    return fx
+eurusd_subscription_status = None
 
 
 # =============================================================================
@@ -71,27 +61,125 @@ def normalize_symbol(symbol):
 
 
 # =============================================================================
+# SESION FXCM
+# =============================================================================
+
+def connect_fxcm():
+
+    global fx
+    global fx_connected
+
+    with fx_lock:
+
+        if fx is not None and fx_connected:
+
+            return fx
+
+
+        if not FXCM_USERNAME:
+
+            raise RuntimeError(
+                "FXCM_USERNAME missing"
+            )
+
+
+        if not FXCM_PASSWORD:
+
+            raise RuntimeError(
+                "FXCM_PASSWORD missing"
+            )
+
+
+        print(
+            "Connecting to FXCM..."
+        )
+
+
+        fx = ForexConnect()
+
+
+        fx.login(
+            FXCM_USERNAME,
+            FXCM_PASSWORD,
+            FXCM_URL,
+            FXCM_CONNECTION,
+            session_id=None,
+            pin=None
+        )
+
+
+        fx_connected = True
+
+
+        print(
+            "FXCM connected."
+        )
+
+
+        return fx
+
+
+# =============================================================================
+# RECONEXION
+# =============================================================================
+
+def reconnect_fxcm():
+
+    global fx
+    global fx_connected
+
+    with fx_lock:
+
+        try:
+
+            if fx is not None:
+
+                fx.logout()
+
+        except Exception as e:
+
+            print(
+                "Logout warning:",
+                str(e)
+            )
+
+
+        fx = None
+
+        fx_connected = False
+
+
+        return connect_fxcm()
+
+
+# =============================================================================
 # OBTENER CUENTA
 # =============================================================================
 
-def get_account(fx):
+def get_account():
 
-    accounts = fx.get_table(
+    session = connect_fxcm()
+
+    accounts = session.get_table(
         ForexConnect.ACCOUNTS
     )
 
-    # Cuenta self-traded normal.
+
+    # Preferimos cuenta self-traded
     for account in accounts:
 
-        if str(account.account_kind) == "32":
+        if str(
+            account.account_kind
+        ) == "32":
 
             return account
 
-    # Si no encontramos kind 32,
-    # usamos la primera disponible.
+
+    # Si no aparece, usamos la primera
     for account in accounts:
 
         return account
+
 
     raise RuntimeError(
         "No FXCM account found"
@@ -102,9 +190,13 @@ def get_account(fx):
 # OBTENER OFFER
 # =============================================================================
 
-def get_offer(fx, instrument):
+def get_offer(
+    instrument="EUR/USD"
+):
 
-    offers = fx.get_table(
+    session = connect_fxcm()
+
+    offers = session.get_table(
         ForexConnect.OFFERS
     )
 
@@ -112,45 +204,76 @@ def get_offer(fx, instrument):
         instrument
     )
 
-    available = []
 
     for offer in offers:
 
-        offer_name = str(
-            offer.instrument
-        )
-
-        available.append(
-            offer_name
-        )
-
         if normalize_symbol(
-            offer_name
+            offer.instrument
         ) == requested:
 
             return offer
 
+
     raise RuntimeError(
-        "Instrument not found. Requested: "
+        "Instrument not found: "
         + instrument
-        + " | Available: "
-        + ", ".join(
-            available[:50]
-        )
     )
 
 
 # =============================================================================
-# CAMBIAR SUBSCRIPTION STATUS
+# ESTABLECER SUBSCRIPTION STATUS
 # =============================================================================
 
 def set_subscription_status(
-    fx,
-    offer,
+    instrument="EUR/USD",
     status="T"
 ):
 
-    request_sub = fx.create_request({
+    global eurusd_subscription_status
+
+    session = connect_fxcm()
+
+    offer = get_offer(
+        instrument
+    )
+
+
+    print(
+        "Current subscription:",
+        offer.instrument,
+        offer.subscription_status
+    )
+
+
+    if str(
+        offer.subscription_status
+    ) == status:
+
+        eurusd_subscription_status = status
+
+        return {
+            "instrument":
+                str(
+                    offer.instrument
+                ),
+
+            "offer_id":
+                str(
+                    offer.offer_id
+                ),
+
+            "previous_status":
+                status,
+
+            "status":
+                status,
+
+            "changed":
+                False
+        }
+
+
+    request_sub = session.create_request({
         fxcorepy.O2GRequestParamsEnum.COMMAND:
             fxcorepy.Constants.Commands.SET_SUBSCRIPTION_STATUS,
 
@@ -161,80 +284,158 @@ def set_subscription_status(
             status
     })
 
+
     if request_sub is None:
 
         raise RuntimeError(
             "Could not create SET_SUBSCRIPTION_STATUS request"
         )
 
-    fx.send_request(
+
+    request_id = (
+        request_sub.request_id
+    )
+
+
+    session.send_request(
         request_sub
     )
 
-    return request_sub.request_id
+
+    print(
+        "SET_SUBSCRIPTION_STATUS sent:",
+        request_id
+    )
 
 
-# =============================================================================
-# ASEGURAR EUR/USD EN ESTADO T
-# =============================================================================
+    # Esperamos que la tabla Offers se actualice
+    for _ in range(20):
 
-def ensure_trading_subscription(
-    fx,
-    instrument
-):
+        time.sleep(
+            0.5
+        )
 
-    offer = get_offer(
-        fx,
+
+        refreshed = get_offer(
+            instrument
+        )
+
+
+        refreshed_status = str(
+            refreshed.subscription_status
+        )
+
+
+        print(
+            "Subscription check:",
+            refreshed_status
+        )
+
+
+        if refreshed_status == status:
+
+            eurusd_subscription_status = status
+
+
+            return {
+                "instrument":
+                    str(
+                        refreshed.instrument
+                    ),
+
+                "offer_id":
+                    str(
+                        refreshed.offer_id
+                    ),
+
+                "previous_status":
+                    str(
+                        offer.subscription_status
+                    ),
+
+                "status":
+                    refreshed_status,
+
+                "changed":
+                    True,
+
+                "request_id":
+                    request_id
+            }
+
+
+    final_offer = get_offer(
         instrument
     )
+
+
+    eurusd_subscription_status = str(
+        final_offer.subscription_status
+    )
+
+
+    raise RuntimeError(
+        "Subscription did not change to "
+        + status
+        + ". Current status="
+        + str(
+            final_offer.subscription_status
+        )
+    )
+
+
+# =============================================================================
+# ASEGURAR SUBSCRIPCION TRADING
+# =============================================================================
+
+def ensure_eurusd_tradable():
+
+    offer = get_offer(
+        "EUR/USD"
+    )
+
 
     current_status = str(
         offer.subscription_status
     )
+
 
     if current_status == "T":
 
         return offer
 
 
+    print(
+        "EUR/USD is not T. "
+        "Attempting subscription..."
+    )
+
+
     set_subscription_status(
-        fx,
-        offer,
+        "EUR/USD",
         "T"
     )
 
 
-    # Damos tiempo a ForexConnect para actualizar la tabla.
-    for _ in range(10):
-
-        time.sleep(0.5)
-
-        refreshed_offer = get_offer(
-            fx,
-            instrument
-        )
-
-        refreshed_status = str(
-            refreshed_offer.subscription_status
-        )
-
-        if refreshed_status == "T":
-
-            return refreshed_offer
-
-
-    refreshed_offer = get_offer(
-        fx,
-        instrument
+    offer = get_offer(
+        "EUR/USD"
     )
 
-    raise RuntimeError(
-        "Could not enable trading subscription. "
-        + "Instrument="
-        + str(refreshed_offer.instrument)
-        + " status="
-        + str(refreshed_offer.subscription_status)
-    )
+
+    if str(
+        offer.subscription_status
+    ) != "T":
+
+        raise RuntimeError(
+            "EUR/USD subscription_status is "
+            + str(
+                offer.subscription_status
+            )
+            + " instead of T"
+        )
+
+
+    return offer
 
 
 # =============================================================================
@@ -242,34 +443,15 @@ def ensure_trading_subscription(
 # =============================================================================
 
 def open_market_order(
-    fx,
-    instrument,
     is_buy,
     amount
 ):
 
-    account = get_account(
-        fx
-    )
+    session = connect_fxcm()
 
-    offer = ensure_trading_subscription(
-        fx,
-        instrument
-    )
+    account = get_account()
 
-    subscription_status = str(
-        offer.subscription_status
-    )
-
-    if subscription_status != "T":
-
-        raise RuntimeError(
-            "Instrument is not available for trading. "
-            + "Instrument="
-            + str(offer.instrument)
-            + " status="
-            + subscription_status
-        )
+    offer = ensure_eurusd_tradable()
 
 
     side = (
@@ -279,7 +461,7 @@ def open_market_order(
     )
 
 
-    request_order = fx.create_order_request(
+    request_order = session.create_order_request(
         order_type=
             fxcorepy.Constants.Orders.TRUE_MARKET_OPEN,
 
@@ -293,14 +475,16 @@ def open_market_order(
             int(amount),
 
         SYMBOL=
-            str(offer.instrument)
+            str(
+                offer.instrument
+            )
     )
 
 
     if request_order is None:
 
         raise RuntimeError(
-            "Could not create market order request"
+            "Could not create TRUE_MARKET_OPEN request"
         )
 
 
@@ -309,8 +493,14 @@ def open_market_order(
     )
 
 
-    fx.send_request(
+    session.send_request(
         request_order
+    )
+
+
+    print(
+        "Market order sent:",
+        request_id
     )
 
 
@@ -319,10 +509,14 @@ def open_market_order(
             request_id,
 
         "instrument":
-            str(offer.instrument),
+            str(
+                offer.instrument
+            ),
 
         "subscription_status":
-            str(offer.subscription_status)
+            str(
+                offer.subscription_status
+            )
     }
 
 
@@ -331,36 +525,26 @@ def open_market_order(
 # =============================================================================
 
 def close_positions(
-    fx,
-    instrument,
     close_long=False,
     close_short=False
 ):
 
-    trades = fx.get_table(
+    session = connect_fxcm()
+
+    trades = session.get_table(
         ForexConnect.TRADES
     )
 
-    account = get_account(
-        fx
-    )
-
-    requested = normalize_symbol(
-        instrument
-    )
+    account = get_account()
 
     closed = []
 
 
     for trade in trades:
 
-        trade_instrument = str(
-            trade.instrument
-        )
-
         if normalize_symbol(
-            trade_instrument
-        ) != requested:
+            trade.instrument
+        ) != "EURUSD":
 
             continue
 
@@ -388,7 +572,7 @@ def close_positions(
         )
 
 
-        request_order = fx.create_order_request(
+        request_order = session.create_order_request(
             order_type=
                 fxcorepy.Constants.Orders.TRUE_MARKET_CLOSE,
 
@@ -413,7 +597,9 @@ def close_positions(
 
             raise RuntimeError(
                 "Could not create close request for trade "
-                + str(trade.trade_id)
+                + str(
+                    trade.trade_id
+                )
             )
 
 
@@ -422,7 +608,7 @@ def close_positions(
         )
 
 
-        fx.send_request(
+        session.send_request(
             request_order
         )
 
@@ -432,14 +618,64 @@ def close_positions(
                 request_id,
 
             "trade_id":
-                str(trade.trade_id),
+                str(
+                    trade.trade_id
+                ),
 
             "instrument":
-                trade_instrument
+                str(
+                    trade.instrument
+                )
         })
 
 
     return closed
+
+
+# =============================================================================
+# INICIALIZACION
+# =============================================================================
+
+def initialize_bridge():
+
+    try:
+
+        connect_fxcm()
+
+
+        print(
+            "FXCM persistent session initialized."
+        )
+
+
+        try:
+
+            result = set_subscription_status(
+                "EUR/USD",
+                "T"
+            )
+
+
+            print(
+                "EUR/USD subscription result:",
+                result
+            )
+
+
+        except Exception as e:
+
+            print(
+                "EUR/USD subscription initialization error:",
+                str(e)
+            )
+
+
+    except Exception as e:
+
+        print(
+            "FXCM initialization error:",
+            str(e)
+        )
 
 
 # =============================================================================
@@ -459,7 +695,7 @@ def home():
 
 
 # =============================================================================
-# STATUS GENERAL
+# STATUS
 # =============================================================================
 
 @app.route(
@@ -468,76 +704,49 @@ def home():
 )
 def status():
 
-    if not FXCM_USERNAME:
-
-        return jsonify({
-            "bridge":
-                "online",
-
-            "fxcm":
-                "credentials_missing",
-
-            "missing":
-                "FXCM_USERNAME"
-        }), 500
-
-
-    if not FXCM_PASSWORD:
-
-        return jsonify({
-            "bridge":
-                "online",
-
-            "fxcm":
-                "credentials_missing",
-
-            "missing":
-                "FXCM_PASSWORD"
-        }), 500
-
-
     try:
 
-        with lock:
+        with fx_lock:
 
-            with get_fxcm() as fx:
+            session = connect_fxcm()
 
-                account = get_account(
-                    fx
-                )
+            account = get_account()
+
+            offer = get_offer(
+                "EUR/USD"
+            )
 
 
-                return jsonify({
-                    "bridge":
-                        "online",
+            return jsonify({
+                "bridge":
+                    "online",
 
-                    "fxcm":
-                        "connected",
+                "fxcm":
+                    "connected",
 
-                    "connection":
-                        FXCM_CONNECTION,
+                "connection":
+                    FXCM_CONNECTION,
 
-                    "balance":
-                        account.balance,
+                "balance":
+                    account.balance,
 
-                    "equity":
-                        account.equity,
+                "equity":
+                    account.equity,
 
-                    "used_margin":
-                        account.used_margin,
+                "used_margin":
+                    account.used_margin,
 
-                    "usable_margin":
-                        account.usable_margin
-                }), 200
+                "usable_margin":
+                    account.usable_margin,
+
+                "eurusd_subscription_status":
+                    str(
+                        offer.subscription_status
+                    )
+            }), 200
 
 
     except Exception as e:
-
-        print(
-            "FXCM STATUS ERROR:",
-            str(e)
-        )
-
 
         return jsonify({
             "bridge":
@@ -552,75 +761,7 @@ def status():
 
 
 # =============================================================================
-# LISTAR INSTRUMENTOS
-# =============================================================================
-
-@app.route(
-    "/instruments",
-    methods=["GET"]
-)
-def instruments():
-
-    try:
-
-        with lock:
-
-            with get_fxcm() as fx:
-
-                offers = fx.get_table(
-                    ForexConnect.OFFERS
-                )
-
-                instrument_list = []
-
-
-                for offer in offers:
-
-                    instrument_list.append({
-                        "instrument":
-                            str(
-                                offer.instrument
-                            ),
-
-                        "offer_id":
-                            str(
-                                offer.offer_id
-                            ),
-
-                        "status":
-                            str(
-                                offer.subscription_status
-                            )
-                    })
-
-
-                return jsonify({
-                    "status":
-                        "ok",
-
-                    "count":
-                        len(
-                            instrument_list
-                        ),
-
-                    "instruments":
-                        instrument_list
-                }), 200
-
-
-    except Exception as e:
-
-        return jsonify({
-            "status":
-                "error",
-
-            "error":
-                str(e)
-        }), 500
-
-
-# =============================================================================
-# ESTADO EUR/USD
+# INSTRUMENT STATUS
 # =============================================================================
 
 @app.route(
@@ -631,42 +772,39 @@ def instrument_status():
 
     try:
 
-        with lock:
+        with fx_lock:
 
-            with get_fxcm() as fx:
-
-                offer = get_offer(
-                    fx,
-                    "EUR/USD"
-                )
+            offer = get_offer(
+                "EUR/USD"
+            )
 
 
-                return jsonify({
-                    "instrument":
-                        str(
-                            offer.instrument
-                        ),
+            return jsonify({
+                "instrument":
+                    str(
+                        offer.instrument
+                    ),
 
-                    "offer_id":
-                        str(
-                            offer.offer_id
-                        ),
+                "offer_id":
+                    str(
+                        offer.offer_id
+                    ),
 
-                    "subscription_status":
-                        str(
-                            offer.subscription_status
-                        ),
+                "subscription_status":
+                    str(
+                        offer.subscription_status
+                    ),
 
-                    "bid":
-                        float(
-                            offer.bid
-                        ),
+                "bid":
+                    float(
+                        offer.bid
+                    ),
 
-                    "ask":
-                        float(
-                            offer.ask
-                        )
-                }), 200
+                "ask":
+                    float(
+                        offer.ask
+                    )
+            }), 200
 
 
     except Exception as e:
@@ -681,7 +819,7 @@ def instrument_status():
 
 
 # =============================================================================
-# SUSCRIBIR EUR/USD PARA TRADING
+# SUSCRIBIR EUR/USD
 # =============================================================================
 
 @app.route(
@@ -692,60 +830,27 @@ def subscribe_eurusd():
 
     try:
 
-        with lock:
+        with fx_lock:
 
-            with get_fxcm() as fx:
-
-                original_offer = get_offer(
-                    fx,
-                    "EUR/USD"
-                )
+            result = set_subscription_status(
+                "EUR/USD",
+                "T"
+            )
 
 
-                original_status = str(
-                    original_offer.subscription_status
-                )
+            return jsonify({
+                "status":
+                    "ok",
 
-
-                enabled_offer = (
-                    ensure_trading_subscription(
-                        fx,
-                        "EUR/USD"
-                    )
-                )
-
-
-                return jsonify({
-                    "status":
-                        "ok",
-
-                    "instrument":
-                        str(
-                            enabled_offer.instrument
-                        ),
-
-                    "offer_id":
-                        str(
-                            enabled_offer.offer_id
-                        ),
-
-                    "previous_subscription_status":
-                        original_status,
-
-                    "subscription_status":
-                        str(
-                            enabled_offer.subscription_status
-                        ),
-
-                    "message":
-                        "EUR/USD subscription enabled for trading"
-                }), 200
+                "result":
+                    result
+            }), 200
 
 
     except Exception as e:
 
         print(
-            "FXCM SUBSCRIPTION ERROR:",
+            "FXCM subscription error:",
             str(e)
         )
 
@@ -760,7 +865,52 @@ def subscribe_eurusd():
 
 
 # =============================================================================
-# TRADINGVIEW WEBHOOK
+# RECONNECT
+# =============================================================================
+
+@app.route(
+    "/reconnect",
+    methods=["GET"]
+)
+def reconnect():
+
+    try:
+
+        with fx_lock:
+
+            reconnect_fxcm()
+
+            result = set_subscription_status(
+                "EUR/USD",
+                "T"
+            )
+
+
+            return jsonify({
+                "status":
+                    "ok",
+
+                "fxcm":
+                    "reconnected",
+
+                "subscription":
+                    result
+            }), 200
+
+
+    except Exception as e:
+
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                str(e)
+        }), 500
+
+
+# =============================================================================
+# TRADINGVIEW
 # =============================================================================
 
 @app.route(
@@ -792,7 +942,7 @@ def tradingview():
 
 
     # =========================================================================
-    # VALIDAR SECRET
+    # SECRET
     # =========================================================================
 
     received_secret = data.get(
@@ -804,11 +954,6 @@ def tradingview():
 
         if received_secret != WEBHOOK_SECRET:
 
-            print(
-                "Webhook rejected: invalid secret"
-            )
-
-
             return jsonify({
                 "status":
                     "rejected",
@@ -819,7 +964,7 @@ def tradingview():
 
 
     # =========================================================================
-    # VALIDAR BROKER
+    # BROKER
     # =========================================================================
 
     if data.get(
@@ -836,7 +981,7 @@ def tradingview():
 
 
     # =========================================================================
-    # VALIDAR SIMBOLO
+    # SYMBOL
     # =========================================================================
 
     if data.get(
@@ -868,7 +1013,7 @@ def tradingview():
 
 
     # =========================================================================
-    # SEGURIDAD DE TAMANO
+    # TAMANO FIJO
     # =========================================================================
 
     if quantity != 1000:
@@ -888,221 +1033,168 @@ def tradingview():
 
     try:
 
-        with lock:
+        with fx_lock:
 
-            with get_fxcm() as fx:
+            # =================================================================
+            # BUY
+            # =================================================================
 
-                # =============================================================
-                # BUY
-                # =============================================================
+            if action == "BUY":
 
-                if action == "BUY":
-
-                    result = open_market_order(
-                        fx,
-                        "EUR/USD",
-                        True,
-                        quantity
-                    )
+                result = open_market_order(
+                    True,
+                    quantity
+                )
 
 
-                    print(
-                        "FXCM BUY executed:",
-                        result
-                    )
+                return jsonify({
+                    "status":
+                        "executed",
+
+                    "action":
+                        "BUY",
+
+                    "symbol":
+                        result[
+                            "instrument"
+                        ],
+
+                    "quantity":
+                        quantity,
+
+                    "request_id":
+                        result[
+                            "request_id"
+                        ],
+
+                    "subscription_status":
+                        result[
+                            "subscription_status"
+                        ]
+                }), 200
 
 
-                    return jsonify({
-                        "status":
-                            "executed",
+            # =================================================================
+            # SELL
+            # =================================================================
 
-                        "action":
-                            "BUY",
+            elif action == "SELL":
 
-                        "symbol":
-                            result[
-                                "instrument"
-                            ],
-
-                        "quantity":
-                            quantity,
-
-                        "request_id":
-                            result[
-                                "request_id"
-                            ],
-
-                        "subscription_status":
-                            result[
-                                "subscription_status"
-                            ]
-                    }), 200
+                result = open_market_order(
+                    False,
+                    quantity
+                )
 
 
-                # =============================================================
-                # SELL
-                # =============================================================
+                return jsonify({
+                    "status":
+                        "executed",
 
-                elif action == "SELL":
+                    "action":
+                        "SELL",
 
-                    result = open_market_order(
-                        fx,
-                        "EUR/USD",
-                        False,
-                        quantity
-                    )
+                    "symbol":
+                        result[
+                            "instrument"
+                        ],
 
+                    "quantity":
+                        quantity,
 
-                    print(
-                        "FXCM SELL executed:",
-                        result
-                    )
+                    "request_id":
+                        result[
+                            "request_id"
+                        ],
 
-
-                    return jsonify({
-                        "status":
-                            "executed",
-
-                        "action":
-                            "SELL",
-
-                        "symbol":
-                            result[
-                                "instrument"
-                            ],
-
-                        "quantity":
-                            quantity,
-
-                        "request_id":
-                            result[
-                                "request_id"
-                            ],
-
-                        "subscription_status":
-                            result[
-                                "subscription_status"
-                            ]
-                    }), 200
+                    "subscription_status":
+                        result[
+                            "subscription_status"
+                        ]
+                }), 200
 
 
-                # =============================================================
-                # CLOSE LONG
-                # =============================================================
+            # =================================================================
+            # CLOSE LONG
+            # =================================================================
 
-                elif action == "CLOSE_LONG":
+            elif action == "CLOSE_LONG":
 
-                    closed = close_positions(
-                        fx,
-                        "EUR/USD",
-                        close_long=True
-                    )
+                closed = close_positions(
+                    close_long=True
+                )
 
 
-                    print(
-                        "FXCM CLOSE_LONG:",
+                return jsonify({
+                    "status":
+                        "executed",
+
+                    "action":
+                        "CLOSE_LONG",
+
+                    "closed":
                         closed
-                    )
+                }), 200
 
 
-                    return jsonify({
-                        "status":
-                            "executed",
+            # =================================================================
+            # CLOSE SHORT
+            # =================================================================
 
-                        "action":
-                            "CLOSE_LONG",
+            elif action == "CLOSE_SHORT":
 
-                        "closed":
-                            closed
-                    }), 200
-
-
-                # =============================================================
-                # CLOSE SHORT
-                # =============================================================
-
-                elif action == "CLOSE_SHORT":
-
-                    closed = close_positions(
-                        fx,
-                        "EUR/USD",
-                        close_short=True
-                    )
+                closed = close_positions(
+                    close_short=True
+                )
 
 
-                    print(
-                        "FXCM CLOSE_SHORT:",
+                return jsonify({
+                    "status":
+                        "executed",
+
+                    "action":
+                        "CLOSE_SHORT",
+
+                    "closed":
                         closed
-                    )
+                }), 200
 
 
-                    return jsonify({
-                        "status":
-                            "executed",
+            # =================================================================
+            # CLOSE ALL
+            # =================================================================
 
-                        "action":
-                            "CLOSE_SHORT",
+            elif action == "CLOSE_ALL":
 
-                        "closed":
-                            closed
-                    }), 200
+                longs = close_positions(
+                    close_long=True
+                )
 
-
-                # =============================================================
-                # CLOSE ALL
-                # =============================================================
-
-                elif action == "CLOSE_ALL":
-
-                    longs = close_positions(
-                        fx,
-                        "EUR/USD",
-                        close_long=True
-                    )
-
-                    shorts = close_positions(
-                        fx,
-                        "EUR/USD",
-                        close_short=True
-                    )
-
-                    all_closed = (
-                        longs +
-                        shorts
-                    )
+                shorts = close_positions(
+                    close_short=True
+                )
 
 
-                    print(
-                        "FXCM CLOSE_ALL:",
-                        all_closed
-                    )
+                return jsonify({
+                    "status":
+                        "executed",
+
+                    "action":
+                        "CLOSE_ALL",
+
+                    "closed":
+                        longs + shorts
+                }), 200
 
 
-                    return jsonify({
-                        "status":
-                            "executed",
+            else:
 
-                        "action":
-                            "CLOSE_ALL",
+                return jsonify({
+                    "status":
+                        "rejected",
 
-                        "closed":
-                            all_closed
-                    }), 200
-
-
-                # =============================================================
-                # ACCION DESCONOCIDA
-                # =============================================================
-
-                else:
-
-                    return jsonify({
-                        "status":
-                            "rejected",
-
-                        "message":
-                            "Unknown action"
-                    }), 400
+                    "message":
+                        "Unknown action"
+                }), 400
 
 
     except Exception as e:
@@ -1113,6 +1205,12 @@ def tradingview():
         )
 
 
+        # Forzamos reconexion en el siguiente intento
+        global fx_connected
+
+        fx_connected = False
+
+
         return jsonify({
             "status":
                 "error",
@@ -1120,3 +1218,10 @@ def tradingview():
             "error":
                 str(e)
         }), 500
+
+
+# =============================================================================
+# INICIAR SESION AL ARRANCAR EL SERVIDOR
+# =============================================================================
+
+initialize_bridge()
