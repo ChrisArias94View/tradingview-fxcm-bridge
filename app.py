@@ -46,12 +46,13 @@ def get_account(fx):
         ForexConnect.ACCOUNTS
     )
 
-    # Primero buscar cuenta normal self-traded
+    # Primero intenta usar una cuenta self-traded normal
     for account in accounts:
         if account.account_kind == "32":
             return account
 
-    # Si no existe, usar la primera disponible
+    # Si no encuentra account_kind 32,
+    # utiliza la primera cuenta disponible
     for account in accounts:
         return account
 
@@ -61,7 +62,7 @@ def get_account(fx):
 
 
 # =============================================================================
-# OBTENER OFFER EUR/USD
+# OBTENER INSTRUMENTO DISPONIBLE
 # =============================================================================
 
 def get_offer(fx, instrument):
@@ -69,12 +70,43 @@ def get_offer(fx, instrument):
         ForexConnect.OFFERS
     )
 
+    normalized = (
+        instrument
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+        .upper()
+    )
+
+    available = []
+
     for offer in offers:
-        if offer.instrument == instrument:
+        offer_name = str(
+            offer.instrument
+        )
+
+        offer_normalized = (
+            offer_name
+            .replace("/", "")
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+            .upper()
+        )
+
+        available.append(
+            offer_name
+        )
+
+        if offer_normalized == normalized:
             return offer
 
     raise RuntimeError(
-        "Instrument not found: " + instrument
+        "Instrument not found. Requested: "
+        + instrument
+        + " | Available: "
+        + ", ".join(available[:50])
     )
 
 
@@ -88,9 +120,12 @@ def open_market_order(
     is_buy,
     amount
 ):
-
     account = get_account(fx)
-    offer = get_offer(fx, instrument)
+
+    offer = get_offer(
+        fx,
+        instrument
+    )
 
     side = (
         fxcorepy.Constants.BUY
@@ -101,17 +136,21 @@ def open_market_order(
     request_order = fx.create_order_request(
         order_type=fxcorepy.Constants.Orders.TRUE_MARKET_OPEN,
         ACCOUNT_ID=account.account_id,
-        OFFER_ID=offer.offer_id,
         BUY_SELL=side,
         AMOUNT=int(amount),
-        SYMBOL=instrument
+        SYMBOL=offer.instrument
     )
 
-    response = fx.send_request(
+    request_id = request_order.request_id
+
+    fx.send_request(
         request_order
     )
 
-    return response.request_id
+    return {
+        "request_id": request_id,
+        "instrument": offer.instrument
+    }
 
 
 # =============================================================================
@@ -124,7 +163,6 @@ def close_positions(
     close_long=False,
     close_short=False
 ):
-
     trades = fx.get_table(
         ForexConnect.TRADES
     )
@@ -133,9 +171,31 @@ def close_positions(
 
     closed = []
 
+    normalized_requested = (
+        instrument
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+        .upper()
+    )
+
     for trade in trades:
 
-        if trade.instrument != instrument:
+        trade_instrument = str(
+            trade.instrument
+        )
+
+        trade_normalized = (
+            trade_instrument
+            .replace("/", "")
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+            .upper()
+        )
+
+        if trade_normalized != normalized_requested:
             continue
 
         is_long = (
@@ -164,13 +224,19 @@ def close_positions(
             AMOUNT=trade.amount
         )
 
-        response = fx.send_request(
+        request_id = (
+            request_order.request_id
+        )
+
+        fx.send_request(
             request_order
         )
 
-        closed.append(
-            response.request_id
-        )
+        closed.append({
+            "request_id": request_id,
+            "trade_id": trade.trade_id,
+            "instrument": trade_instrument
+        })
 
     return closed
 
@@ -181,7 +247,6 @@ def close_positions(
 
 @app.route("/", methods=["GET"])
 def home():
-
     return "Bridge online", 200
 
 
@@ -193,27 +258,21 @@ def home():
 def status():
 
     if not FXCM_USERNAME:
-
         return jsonify({
             "bridge": "online",
             "fxcm": "credentials_missing",
             "missing": "FXCM_USERNAME"
         }), 500
 
-
     if not FXCM_PASSWORD:
-
         return jsonify({
             "bridge": "online",
             "fxcm": "credentials_missing",
             "missing": "FXCM_PASSWORD"
         }), 500
 
-
     try:
-
         with lock:
-
             with get_fxcm() as fx:
 
                 account = get_account(fx)
@@ -227,7 +286,6 @@ def status():
                     "used_margin": account.used_margin,
                     "usable_margin": account.usable_margin
                 }), 200
-
 
     except Exception as e:
 
@@ -244,6 +302,42 @@ def status():
 
 
 # =============================================================================
+# LISTAR INSTRUMENTOS DISPONIBLES
+# =============================================================================
+
+@app.route("/instruments", methods=["GET"])
+def instruments():
+
+    try:
+        with lock:
+            with get_fxcm() as fx:
+
+                offers = fx.get_table(
+                    ForexConnect.OFFERS
+                )
+
+                instrument_list = []
+
+                for offer in offers:
+                    instrument_list.append(
+                        str(offer.instrument)
+                    )
+
+                return jsonify({
+                    "status": "ok",
+                    "count": len(instrument_list),
+                    "instruments": instrument_list
+                }), 200
+
+    except Exception as e:
+
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+
+# =============================================================================
 # TRADINGVIEW WEBHOOK
 # =============================================================================
 
@@ -255,7 +349,6 @@ def tradingview():
     )
 
     if not data:
-
         return jsonify({
             "status": "error",
             "message": "Invalid JSON"
@@ -365,7 +458,7 @@ def tradingview():
 
                 if action == "BUY":
 
-                    request_id = open_market_order(
+                    result = open_market_order(
                         fx,
                         "EUR/USD",
                         True,
@@ -374,15 +467,15 @@ def tradingview():
 
                     print(
                         "FXCM BUY executed:",
-                        request_id
+                        result
                     )
 
                     return jsonify({
                         "status": "executed",
                         "action": "BUY",
-                        "symbol": "EUR/USD",
+                        "symbol": result["instrument"],
                         "quantity": quantity,
-                        "request_id": request_id
+                        "request_id": result["request_id"]
                     }), 200
 
 
@@ -392,7 +485,7 @@ def tradingview():
 
                 elif action == "SELL":
 
-                    request_id = open_market_order(
+                    result = open_market_order(
                         fx,
                         "EUR/USD",
                         False,
@@ -401,15 +494,15 @@ def tradingview():
 
                     print(
                         "FXCM SELL executed:",
-                        request_id
+                        result
                     )
 
                     return jsonify({
                         "status": "executed",
                         "action": "SELL",
-                        "symbol": "EUR/USD",
+                        "symbol": result["instrument"],
                         "quantity": quantity,
-                        "request_id": request_id
+                        "request_id": result["request_id"]
                     }), 200
 
 
@@ -479,15 +572,20 @@ def tradingview():
                         close_short=True
                     )
 
+                    all_closed = (
+                        longs +
+                        shorts
+                    )
+
                     print(
                         "FXCM CLOSE_ALL:",
-                        longs + shorts
+                        all_closed
                     )
 
                     return jsonify({
                         "status": "executed",
                         "action": "CLOSE_ALL",
-                        "closed": longs + shorts
+                        "closed": all_closed
                     }), 200
 
 
